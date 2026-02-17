@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: wp-lightgallery
+ * Plugin Name: Lightgallery Imagebox 
  * Plugin URI: https://linge-ma.ro/wp-lightgallery
- * Description: lightGallery for Wordpress
+ * Description: lightGallery for Wordpress, 
  * Version: r3
  * Author: Znuff
  * Author URI: https://linge-ma.ro
