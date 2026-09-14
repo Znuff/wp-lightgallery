@@ -26,8 +26,266 @@ function wplg_content_has_image_links( $content ) {
 }
 
 function wplg_content_has_500px_links( $content ) {
-	// Matches the specific host/path requirement.
-	return (bool) preg_match( '#https?://drscdn\.500px\.org/photo/#i', (string) $content );
+	// Matches both the old direct CDN links and the newer 500px page links.
+	return (bool) preg_match( '#https?://(?:drscdn\.500px\.org/photo/|(?:www\.)?500px\.com/photo/)#i', (string) $content );
+}
+
+/**
+ * Is a string a valid 500px base62 photo id?
+ *
+ * @param string $id
+ * @return bool
+ */
+function wplg_500px_valid_id( $id ) {
+	return (bool) preg_match( '/^[A-Za-z0-9_-]{6,16}$/', (string) $id );
+}
+
+/**
+ * Parse a 500px photo URL into a reference.
+ *
+ * Supports the current `/photo/<base62>` URLs (GraphQL node id) and the legacy
+ * `/photo/<numeric>/<slug>` URLs (legacy id).
+ *
+ * @param string $url
+ * @return array{type:string,value:string}|null
+ */
+function wplg_500px_parse_ref( $url ) {
+	$url = (string) $url;
+
+	// Legacy: /photo/1122538020/at-night-by-videophotoart-com
+	if ( preg_match( '~https?://(?:www\.)?500px\.com/photo/([0-9]{4,20})/~i', $url, $m ) ) {
+		return array(
+			'type'  => 'legacy',
+			'value' => $m[1],
+		);
+	}
+
+	// Current: /photo/d4hHJN8xaUd
+	if ( preg_match( '~https?://(?:www\.)?500px\.com/photo/([A-Za-z0-9_-]{6,16})(?:[/?#]|$)~i', $url, $m ) ) {
+		return array(
+			'type'  => 'node',
+			'value' => $m[1],
+		);
+	}
+
+	return null;
+}
+
+/**
+ * Build a stable key for a photo reference.
+ *
+ * @param array $ref
+ * @return string
+ */
+function wplg_500px_ref_key( $ref ) {
+	return $ref['type'] . '_' . $ref['value'];
+}
+
+/**
+ * Normalise a list of photo references, dropping duplicates/invalid entries.
+ *
+ * @param array $refs
+ * @return array<string,array{type:string,value:string}> Keyed by ref key.
+ */
+function wplg_500px_normalize_refs( $refs ) {
+	$out = array();
+
+	foreach ( (array) $refs as $ref ) {
+		if ( ! is_array( $ref ) || empty( $ref['type'] ) || ! isset( $ref['value'] ) ) {
+			continue;
+		}
+
+		$type  = (string) $ref['type'];
+		$value = (string) $ref['value'];
+
+		if ( 'node' === $type && wplg_500px_valid_id( $value ) ) {
+			$out[ $type . '_' . $value ] = array(
+				'type'  => $type,
+				'value' => $value,
+			);
+		} elseif ( 'legacy' === $type && preg_match( '/^[0-9]{4,20}$/', $value ) ) {
+			$out[ $type . '_' . $value ] = array(
+				'type'  => $type,
+				'value' => $value,
+			);
+		}
+	}
+
+	return $out;
+}
+
+/**
+ * Parse the `expiry` unix timestamp from a signed 500px CDN URL.
+ *
+ * @param string $url
+ * @return int Expiry timestamp, or 0 when unknown.
+ */
+function wplg_500px_parse_expiry( $url ) {
+	$parts = wp_parse_url( $url );
+	if ( empty( $parts['query'] ) ) {
+		return 0;
+	}
+
+	$query = array();
+	wp_parse_str( $parts['query'], $query );
+
+	return isset( $query['expiry'] ) ? (int) $query['expiry'] : 0;
+}
+
+/**
+ * Pick the largest direct URL and a thumbnail from an API `urls` set.
+ *
+ * @param array $urls
+ * @return array{full:string, thumb:string}
+ */
+function wplg_500px_pick_urls( $urls ) {
+	$urls = is_array( $urls ) ? $urls : array();
+
+	$full = '';
+	foreach ( array( 'size_4k', 'size_2048', 'size_1024', 'size_600' ) as $key ) {
+		if ( ! empty( $urls[ $key ] ) ) {
+			$full = $urls[ $key ];
+			break;
+		}
+	}
+
+	$thumb = ! empty( $urls['size_600'] ) ? $urls['size_600'] : $full;
+
+	return array(
+		'full'  => $full,
+		'thumb' => $thumb,
+	);
+}
+
+/**
+ * Query the 500px GraphQL API for one or more photo refs in a single request.
+ *
+ * @param array $refs List of array{type:string,value:string}.
+ * @return array<string,array{full:string,thumb:string,expiry:int}> Keyed by ref key.
+ */
+function wplg_500px_api_query( $refs ) {
+	$refs = wplg_500px_normalize_refs( $refs );
+	if ( empty( $refs ) ) {
+		return array();
+	}
+
+	$selections = array();
+	$i          = 0;
+	foreach ( $refs as $ref ) {
+		$fields = 'id urls { size_600 size_1024 size_2048 size_4k }';
+		if ( 'legacy' === $ref['type'] ) {
+			$selections[] = 'p' . $i . ': getPhotoByLegacyId(legacyId: ' . wp_json_encode( $ref['value'] ) . ') { ' . $fields . ' }';
+		} else {
+			$selections[] = 'p' . $i . ': getPhotoById(id: ' . wp_json_encode( $ref['value'] ) . ') { ' . $fields . ' }';
+		}
+		$i++;
+	}
+
+	$query = 'query WPLGGetPhotos { ' . implode( ' ', $selections ) . ' }';
+
+	$response = wp_remote_post(
+		'https://api-neo.500px.com/graphql',
+		array(
+			'timeout' => 8,
+			'headers' => array(
+				'Content-Type'      => 'application/json',
+				'x-500px-device-id' => wp_generate_uuid4(),
+				'x-500px-platform'  => 'Web',
+				'referer'           => 'https://500px.com/',
+			),
+			'body'    => wp_json_encode( array( 'query' => $query ) ),
+		)
+	);
+
+	if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+		return array();
+	}
+
+	$data = json_decode( wp_remote_retrieve_body( $response ), true );
+	if ( empty( $data['data'] ) || ! is_array( $data['data'] ) ) {
+		return array();
+	}
+
+	$out = array();
+	$i   = 0;
+	foreach ( array_keys( $refs ) as $key ) {
+		$alias = 'p' . $i;
+		$i++;
+
+		if ( empty( $data['data'][ $alias ]['id'] ) || empty( $data['data'][ $alias ]['urls'] ) ) {
+			continue;
+		}
+
+		$picked = wplg_500px_pick_urls( $data['data'][ $alias ]['urls'] );
+		if ( '' === $picked['full'] ) {
+			continue;
+		}
+
+		$out[ $key ] = array(
+			'full'   => $picked['full'],
+			'thumb'  => $picked['thumb'],
+			'expiry' => wplg_500px_parse_expiry( $picked['full'] ),
+		);
+	}
+
+	return $out;
+}
+
+/**
+ * Resolve 500px photo refs to signed direct URLs, using a transient cache.
+ *
+ * Entries are refreshed shortly before their signed URL expires.
+ *
+ * @param array $refs List of array{type:string,value:string}.
+ * @return array<string,array{full:string,thumb:string,expiry:int}> Keyed by ref key.
+ */
+function wplg_500px_resolve_refs( $refs ) {
+	$refs = wplg_500px_normalize_refs( $refs );
+	if ( empty( $refs ) ) {
+		return array();
+	}
+
+	$resolved = array();
+	$missing  = array();
+
+	foreach ( $refs as $key => $ref ) {
+		$cached = get_transient( 'wplg_500px_' . $key );
+		if ( is_array( $cached ) && ! empty( $cached['full'] ) ) {
+			$expiry = isset( $cached['expiry'] ) ? (int) $cached['expiry'] : 0;
+			if ( 0 === $expiry || $expiry - time() > 300 ) {
+				$resolved[ $key ] = $cached;
+				continue;
+			}
+		}
+
+		if ( get_transient( 'wplg_500px_err_' . $key ) ) {
+			continue;
+		}
+
+		$missing[ $key ] = $ref;
+	}
+
+	if ( empty( $missing ) ) {
+		return $resolved;
+	}
+
+	$fetched = wplg_500px_api_query( $missing );
+
+	foreach ( $missing as $key => $ref ) {
+		if ( empty( $fetched[ $key ]['full'] ) ) {
+			set_transient( 'wplg_500px_err_' . $key, 1, 10 * MINUTE_IN_SECONDS );
+			continue;
+		}
+
+		$entry  = $fetched[ $key ];
+		$expiry = isset( $entry['expiry'] ) ? (int) $entry['expiry'] : 0;
+		$ttl    = $expiry > 0 ? max( 60, $expiry - time() - 600 ) : HOUR_IN_SECONDS;
+
+		set_transient( 'wplg_500px_' . $key, $entry, $ttl );
+		$resolved[ $key ] = $entry;
+	}
+
+	return $resolved;
 }
 
 /**
@@ -282,7 +540,9 @@ JS;
 /**
  * Add data-lightgallery attributes:
  * - post-gallery: <a> that contains <img> (default behavior)
- * - stirile-zilei: <a href="https://drscdn.500px.org/photo/..."> (only in that category)
+ * - stirile-zilei: <a href="https://500px.com/photo/..."> (resolved to a direct
+ *   image) or <a href="https://drscdn.500px.org/photo/..."> (already direct),
+ *   only in that category
  *
  * @param string $content The post content.
  * @return string Modified content.
@@ -314,18 +574,47 @@ function wplg_add_data_attribute( $content ) {
 		}
 	}
 
-	// B) stirile-zilei: links to drscdn.500px.org/photo => stirile-zilei gallery
+	// B) stirile-zilei: links to 500px (page or direct CDN) => stirile-zilei gallery
 	if ( $is_stirile ) {
-		$st_links = $xpath->query( '//a[contains(@href,"drscdn.500px.org/photo")]' );
-    if ( $st_links && $st_links->length > 0 ) {
-			foreach ( $st_links as $link ) {
-				$link->setAttribute( 'data-lightgallery', 'stirile-zilei' );
+		$st_links = $xpath->query( '//a[contains(@href,"drscdn.500px.org/photo") or contains(@href,"500px.com/photo/")]' );
 
-				// Reuse the original link as thumbnail source
-				$href = $link->getAttribute( 'href' );
-				if ( ! empty( $href ) ) {
-					$link->setAttribute( 'data-exthumbimage', esc_url( $href ) );
+		if ( $st_links && $st_links->length > 0 ) {
+			// Resolve all 500px page links for this post in one API round-trip.
+			$refs = array();
+			foreach ( $st_links as $link ) {
+				$ref = wplg_500px_parse_ref( $link->getAttribute( 'href' ) );
+				if ( $ref ) {
+					$refs[ wplg_500px_ref_key( $ref ) ] = $ref;
 				}
+			}
+			$resolved = wplg_500px_resolve_refs( $refs );
+
+			foreach ( $st_links as $link ) {
+				$href = $link->getAttribute( 'href' );
+				$ref  = wplg_500px_parse_ref( $href );
+
+				if ( $ref ) {
+					// 500px page URL -> direct signed image URL.
+					$key = wplg_500px_ref_key( $ref );
+
+					if ( empty( $resolved[ $key ]['full'] ) ) {
+						// Unresolved: leave it as a plain external link.
+						continue;
+					}
+
+					$href = $resolved[ $key ]['full'];
+					$link->setAttribute( 'href', $href );
+
+					$thumb = ! empty( $resolved[ $key ]['thumb'] ) ? $resolved[ $key ]['thumb'] : $href;
+					$link->setAttribute( 'data-exthumbimage', $thumb );
+				} else {
+					// Older format: already a direct drscdn image.
+					if ( ! empty( $href ) ) {
+						$link->setAttribute( 'data-exthumbimage', esc_url( $href ) );
+					}
+				}
+
+				$link->setAttribute( 'data-lightgallery', 'stirile-zilei' );
 
 				// Use the link text as caption/title (e.g. "Blondă")
 				$caption = trim( preg_replace( '/\s+/', ' ', $link->textContent ) );
@@ -353,4 +642,41 @@ function wplg_add_data_attribute( $content ) {
 	return $modified_html;
 }
 add_filter( 'the_content', 'wplg_add_data_attribute' );
+
+/**
+ * Pre-warm the 500px direct-URL cache when a stirile-zilei post is published.
+ *
+ * @param int $post_id
+ */
+function wplg_500px_prime_post( $post_id ) {
+	if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+		return;
+	}
+
+	$post = get_post( $post_id );
+	if ( ! $post instanceof WP_Post || 'post' !== $post->post_type || 'publish' !== $post->post_status ) {
+		return;
+	}
+
+	if ( ! has_category( 'stirile-zilei', $post ) ) {
+		return;
+	}
+
+	if ( ! wplg_content_has_500px_links( $post->post_content ) ) {
+		return;
+	}
+
+	if ( preg_match_all( '~https?://(?:www\.)?500px\.com/photo/[^"\'\s<>]+~i', $post->post_content, $matches ) ) {
+		$refs = array();
+		foreach ( $matches[0] as $url ) {
+			$ref = wplg_500px_parse_ref( $url );
+			if ( $ref ) {
+				$refs[] = $ref;
+			}
+		}
+
+		wplg_500px_resolve_refs( $refs );
+	}
+}
+add_action( 'save_post', 'wplg_500px_prime_post', 20 );
 
